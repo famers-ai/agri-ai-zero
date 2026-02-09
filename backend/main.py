@@ -23,9 +23,35 @@ from supabase import create_client, Client
 import hashlib
 from dotenv import load_dotenv
 import secrets
+import logging
+import traceback
+import sys
+from contextlib import asynccontextmanager
 
 # Load environment variables from .env file
 load_dotenv()
+
+# ============================================================================
+# LOGGING CONFIGURATION
+# ============================================================================
+
+# Configure logging with detailed format
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(name)s | %(funcName)s:%(lineno)d | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+# Create logger
+logger = logging.getLogger("AgriAI")
+logger.setLevel(logging.INFO)
+
+# Suppress noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # ============================================================================
 # SECURITY UTILITIES
@@ -44,6 +70,123 @@ def hash_phone_number(phone: str) -> str:
 def generate_secure_token(length: int = 32) -> str:
     """Generate cryptographically secure random token"""
     return secrets.token_urlsafe(length)
+
+# ============================================================================
+# ERROR HANDLING & STABILITY UTILITIES
+# ============================================================================
+
+def log_error(error: Exception, context: str = "Unknown", user_id: str = "unknown"):
+    """
+    Log error with full context and traceback
+    
+    Args:
+        error: The exception that occurred
+        context: Description of where/when error occurred
+        user_id: User ID for tracking (if available)
+    """
+    error_details = {
+        "context": context,
+        "user_id": user_id,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "traceback": traceback.format_exc()
+    }
+    
+    logger.error(
+        f"ERROR in {context} | User: {user_id} | "
+        f"{type(error).__name__}: {str(error)}\n"
+        f"Traceback:\n{traceback.format_exc()}"
+    )
+    
+    return error_details
+
+def get_user_friendly_error_message(error: Exception, context: str = "operation") -> str:
+    """
+    Convert technical error to user-friendly message
+    
+    Args:
+        error: The exception
+        context: What was being attempted
+        
+    Returns:
+        User-friendly error message in Korean
+    """
+    error_type = type(error).__name__
+    
+    # Map common errors to friendly messages
+    friendly_messages = {
+        "TimeoutError": "⏱️ 응답 시간이 초과되었습니다. 잠시 후 다시 시도해주세요.",
+        "ConnectionError": "🔌 네트워크 연결에 문제가 있습니다. 잠시 후 다시 시도해주세요.",
+        "HTTPStatusError": "🌐 서비스 연결에 실패했습니다. 잠시 후 다시 시도해주세요.",
+        "JSONDecodeError": "📄 데이터 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.",
+        "KeyError": "🔑 데이터를 찾을 수 없습니다. 관리자에게 문의해주세요.",
+        "ValueError": "⚠️ 입력값이 올바르지 않습니다. 다시 확인해주세요.",
+    }
+    
+    # Return specific message or generic fallback
+    return friendly_messages.get(
+        error_type,
+        f"⚠️ 일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요.\n\n"
+        f"문제가 계속되면 관리자에게 문의해주세요."
+    )
+
+async def safe_async_call(
+    func,
+    *args,
+    context: str = "async operation",
+    fallback_value=None,
+    log_errors: bool = True,
+    **kwargs
+):
+    """
+    Safely execute async function with error handling
+    
+    Args:
+        func: Async function to call
+        *args: Positional arguments
+        context: Description for logging
+        fallback_value: Value to return on error
+        log_errors: Whether to log errors
+        **kwargs: Keyword arguments
+        
+    Returns:
+        Function result or fallback_value on error
+    """
+    try:
+        return await func(*args, **kwargs)
+    except Exception as e:
+        if log_errors:
+            log_error(e, context=context)
+        return fallback_value
+
+def safe_call(
+    func,
+    *args,
+    context: str = "operation",
+    fallback_value=None,
+    log_errors: bool = True,
+    **kwargs
+):
+    """
+    Safely execute sync function with error handling
+    
+    Args:
+        func: Function to call
+        *args: Positional arguments
+        context: Description for logging
+        fallback_value: Value to return on error
+        log_errors: Whether to log errors
+        **kwargs: Keyword arguments
+        
+    Returns:
+        Function result or fallback_value on error
+    """
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        if log_errors:
+            log_error(e, context=context)
+        return fallback_value
 
 # ============================================================================
 # CONFIGURATION
@@ -85,8 +228,14 @@ if SUPABASE_URL and SUPABASE_KEY:
     if SUPABASE_URL.startswith("https://") and not SUPABASE_KEY.startswith("your-"):
         try:
             supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+            logger.info("✅ Supabase client initialized successfully")
         except Exception as e:
-            print(f"⚠️  Failed to initialize Supabase: {e}")
+            logger.error(f"❌ Failed to initialize Supabase: {e}")
+            log_error(e, context="Supabase initialization")
+    else:
+        logger.warning("⚠️  Supabase credentials look invalid - using in-memory mode")
+else:
+    logger.warning("⚠️  Supabase not configured - using in-memory mode")
 
 # ============================================================================
 # DATABASE FUNCTIONS
@@ -437,17 +586,34 @@ async def send_whatsapp_image(to: str, image_url: str, caption: str) -> bool:
 # ============================================================================
 
 async def handle_whatsapp_message(message: Dict):
-    """Handle individual WhatsApp message"""
+    """Handle individual WhatsApp message with robust error handling"""
+    from_number = "unknown"
+    
     try:
-        from_number = message["from"]
-        message_type = message["type"]
+        from_number = message.get("from", "unknown")
+        message_type = message.get("type", "unknown")
         
-        # Get or create user
-        user = await get_user_by_phone(from_number)
+        logger.info(f"Received {message_type} message from {from_number}")
+        
+        # Get or create user with error handling
+        user = await safe_async_call(
+            get_user_by_phone,
+            from_number,
+            context=f"Get user by phone {from_number}",
+            fallback_value=None
+        )
         
         if not user:
             # New user - send onboarding
-            user = await create_user(from_number)
+            logger.info(f"New user detected: {from_number}")
+            
+            user = await safe_async_call(
+                create_user,
+                from_number,
+                context=f"Create user {from_number}",
+                fallback_value={"id": "temp", "phone": from_number}
+            )
+            
             await send_whatsapp_message(
                 from_number,
                 "👋 *Welcome to AgriAI!*\n\n"
@@ -462,12 +628,15 @@ async def handle_whatsapp_message(message: Dict):
         
         # Process based on message type
         if message_type == "text":
-            text = message["text"]["body"]
-            await handle_text_message(user, text)
+            text = message.get("text", {}).get("body", "")
+            if text:
+                await handle_text_message(user, text)
+            else:
+                logger.warning(f"Empty text message from {from_number}")
         
         elif message_type == "image":
-            image_id = message["image"]["id"]
-            caption = message["image"].get("caption", "")
+            image_id = message.get("image", {}).get("id", "")
+            caption = message.get("image", {}).get("caption", "")
             await handle_image_message(user, image_id, caption)
         
         elif message_type == "audio":
@@ -475,44 +644,127 @@ async def handle_whatsapp_message(message: Dict):
                 from_number,
                 "🎤 Voice messages coming soon! For now, please send text or photos."
             )
+        
+        else:
+            logger.warning(f"Unsupported message type '{message_type}' from {from_number}")
+            await send_whatsapp_message(
+                from_number,
+                "⚠️ 지원하지 않는 메시지 형식입니다.\n\n"
+                "텍스트 메시지나 사진을 보내주세요."
+            )
+    
+    except KeyError as e:
+        logger.error(f"Missing required field in message from {from_number}: {e}")
+        log_error(e, context=f"Parse message from {from_number}")
+        
+        # Try to send error message
+        if from_number != "unknown":
+            await safe_async_call(
+                send_whatsapp_message,
+                from_number,
+                "⚠️ 메시지 형식을 인식할 수 없습니다.\n다시 시도해주세요.",
+                context="Send parse error message"
+            )
     
     except Exception as e:
-        print(f"Error handling message: {e}")
+        logger.error(f"Unexpected error handling message from {from_number}: {e}")
+        log_error(e, context=f"handle_whatsapp_message from {from_number}")
+        
+        # Try to send generic error message
+        if from_number != "unknown":
+            await safe_async_call(
+                send_whatsapp_message,
+                from_number,
+                get_user_friendly_error_message(e),
+                context="Send generic error message"
+            )
 
 
 async def handle_text_message(user: Dict, text: str):
-    """Handle text message from farmer"""
+    """Handle text message from farmer with robust error handling"""
     
-    # Check for special commands
-    if text.upper().startswith("JOIN "):
-        await handle_referral(user, text)
-        return
+    user_phone = user.get("phone", "unknown")
+    user_id = user.get("id", "unknown")
     
-    if text.lower() in ["help", "menu", "start"]:
-        await send_help_message(user["phone"])
-        return
-    
-    # Regular diagnosis
-    ai = FreeAIEngine()
-    
-    # Get weather if user has location
-    weather = None
-    if user.get("location"):
-        weather = await get_weather_free(user["location"])
-    
-    # Run diagnosis
-    diagnosis = await ai.diagnose_crop(
-        crop=user.get("primary_crop", "unknown"),
-        observations=text,
-        location=user.get("location", "unknown"),
-        weather=weather
-    )
-    
-    # Save to database
-    await save_diagnosis(user["id"], diagnosis)
-    
-    # Format response
-    response = f"""🌾 *Diagnosis for {diagnosis['crop']}*
+    try:
+        logger.info(f"Processing text message from user {user_id}: {text[:50]}...")
+        
+        # Check for special commands
+        if text.upper().startswith("JOIN "):
+            await handle_referral(user, text)
+            return
+        
+        if text.lower() in ["help", "menu", "start"]:
+            await send_help_message(user_phone)
+            return
+        
+        # Send immediate acknowledgment
+        await send_whatsapp_message(
+            user_phone,
+            "🔬 진단 중입니다...\n잠시만 기다려주세요. (보통 5-10초 소요)"
+        )
+        
+        # Regular diagnosis with timeout protection
+        ai = FreeAIEngine()
+        
+        # Get weather if user has location (with error handling)
+        weather = None
+        if user.get("location"):
+            weather = await safe_async_call(
+                get_weather_free,
+                user["location"],
+                context=f"Weather fetch for user {user_id}",
+                fallback_value=None
+            )
+        
+        # Run diagnosis with timeout
+        try:
+            diagnosis = await asyncio.wait_for(
+                ai.diagnose_crop(
+                    crop=user.get("primary_crop", "unknown"),
+                    observations=text,
+                    location=user.get("location", "unknown"),
+                    weather=weather
+                ),
+                timeout=30.0  # 30 second timeout
+            )
+            
+            logger.info(f"Diagnosis completed for user {user_id}: {diagnosis.get('issue', 'N/A')}")
+            
+        except asyncio.TimeoutError:
+            logger.warning(f"Diagnosis timeout for user {user_id}")
+            await send_whatsapp_message(
+                user_phone,
+                "⏱️ AI 진단이 예상보다 오래 걸리고 있습니다.\n\n"
+                "잠시 후 다시 시도해주시거나, 더 간단한 질문으로 다시 물어봐주세요.\n\n"
+                "예: '토마토 잎이 노랗게 변했어요'"
+            )
+            return
+        
+        except Exception as e:
+            logger.error(f"Diagnosis failed for user {user_id}: {e}")
+            log_error(e, context=f"AI diagnosis for user {user_id}")
+            
+            await send_whatsapp_message(
+                user_phone,
+                get_user_friendly_error_message(e, "AI 진단")
+            )
+            return
+        
+        # Save to database (non-blocking, errors won't stop response)
+        save_success = await safe_async_call(
+            save_diagnosis,
+            user_id,
+            diagnosis,
+            context=f"Save diagnosis for user {user_id}",
+            fallback_value=False
+        )
+        
+        if not save_success:
+            logger.warning(f"Failed to save diagnosis for user {user_id}, but continuing...")
+        
+        # Format response
+        response = f"""🌾 *Diagnosis for {diagnosis['crop']}*
 
 🔍 *Issue:* {diagnosis['issue']}
 📊 *Confidence:* {diagnosis['confidence']}%
@@ -527,9 +779,37 @@ Was this helpful?
 Reply: YES or NO for feedback
 
 Need more help? Send a photo! 📸"""
+        
+        # Send response with error handling
+        send_success = await safe_async_call(
+            send_whatsapp_message,
+            user_phone,
+            response,
+            context=f"Send diagnosis to user {user_id}",
+            fallback_value=False
+        )
+        
+        if not send_success:
+            logger.error(f"Failed to send diagnosis response to user {user_id}")
+        else:
+            logger.info(f"Successfully sent diagnosis to user {user_id}")
     
-    # Send response
-    await send_whatsapp_message(user["phone"], response)
+    except Exception as e:
+        # Catch-all for any unexpected errors
+        logger.error(f"Unexpected error in handle_text_message for user {user_id}: {e}")
+        log_error(e, context=f"handle_text_message for user {user_id}")
+        
+        # Try to send error message to user
+        try:
+            await send_whatsapp_message(
+                user_phone,
+                "⚠️ 일시적인 오류가 발생했습니다.\n\n"
+                "잠시 후 다시 시도해주세요.\n"
+                "문제가 계속되면 'HELP'를 입력해주세요."
+            )
+        except:
+            # If even error message fails, just log it
+            logger.critical(f"Failed to send error message to user {user_id}")
 
 
 async def handle_image_message(user: Dict, image_id: str, caption: str):
@@ -767,50 +1047,89 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "database": "connected" if supabase else "not configured",
-        "whatsapp": "configured" if WHATSAPP_TOKEN else "not configured"
-    }
+    """Health check endpoint with error handling"""
+    try:
+        db_status = "connected" if supabase else "not configured"
+        wa_status = "configured" if WHATSAPP_TOKEN else "not configured"
+        
+        logger.info(f"Health check: DB={db_status}, WhatsApp={wa_status}")
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "database": db_status,
+            "whatsapp": wa_status,
+            "version": "2.0.0-stable"
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        log_error(e, context="Health check")
+        
+        return JSONResponse(
+            {
+                "status": "degraded",
+                "timestamp": datetime.utcnow().isoformat(),
+                "error": str(e)
+            },
+            status_code=500
+        )
 
 
 @app.get("/webhook/whatsapp")
 async def whatsapp_webhook_verify(request: Request):
     """Verify WhatsApp webhook (GET request from Meta)"""
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
+    try:
+        mode = request.query_params.get("hub.mode")
+        token = request.query_params.get("hub.verify_token")
+        challenge = request.query_params.get("hub.challenge")
+        
+        logger.info(f"Webhook verification attempt: mode={mode}, token_match={token == WEBHOOK_VERIFY_TOKEN}")
+        
+        if mode == "subscribe" and token == WEBHOOK_VERIFY_TOKEN:
+            logger.info("✅ WhatsApp webhook verified successfully!")
+            return int(challenge)
+        
+        logger.warning(f"❌ Webhook verification failed: mode={mode}, token_valid={token == WEBHOOK_VERIFY_TOKEN}")
+        return JSONResponse({"error": "Verification failed"}, status_code=403)
     
-    if mode == "subscribe" and token == WEBHOOK_VERIFY_TOKEN:
-        print("✅ WhatsApp webhook verified!")
-        return int(challenge)
-    
-    return JSONResponse({"error": "Verification failed"}, status_code=403)
+    except Exception as e:
+        logger.error(f"Webhook verification error: {e}")
+        log_error(e, context="Webhook verification")
+        return JSONResponse({"error": "Internal error"}, status_code=500)
 
 
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Receive WhatsApp messages"""
+    """Receive WhatsApp messages with robust error handling"""
     try:
         data = await request.json()
+        
+        logger.info(f"Received webhook data: {len(data.get('entry', []))} entries")
         
         # Process in background to respond quickly
         background_tasks.add_task(process_whatsapp_webhook, data)
         
         return {"status": "ok"}
     
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in webhook: {e}")
+        log_error(e, context="Webhook JSON parsing")
+        return JSONResponse({"status": "error", "message": "Invalid JSON"}, status_code=400)
+    
     except Exception as e:
-        print(f"Webhook error: {e}")
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Webhook error: {e}")
+        log_error(e, context="Webhook processing")
+        return JSONResponse({"status": "error", "message": "Internal error"}, status_code=500)
 
 
 async def process_whatsapp_webhook(data: Dict):
-    """Process WhatsApp webhook data in background"""
+    """Process WhatsApp webhook data in background with error handling"""
     try:
         if data.get("object") != "whatsapp_business_account":
+            logger.warning(f"Ignoring non-WhatsApp webhook: {data.get('object')}")
             return
+        
+        message_count = 0
         
         for entry in data.get("entry", []):
             for change in entry.get("changes", []):
@@ -818,10 +1137,21 @@ async def process_whatsapp_webhook(data: Dict):
                 
                 if "messages" in value:
                     for message in value["messages"]:
-                        await handle_whatsapp_message(message)
+                        message_count += 1
+                        
+                        # Process each message with error handling
+                        await safe_async_call(
+                            handle_whatsapp_message,
+                            message,
+                            context=f"Process webhook message {message.get('id', 'unknown')}",
+                            log_errors=True
+                        )
+        
+        logger.info(f"Processed {message_count} messages from webhook")
     
     except Exception as e:
-        print(f"Error processing webhook: {e}")
+        logger.error(f"Error processing webhook data: {e}")
+        log_error(e, context="process_whatsapp_webhook")
 
 
 @app.get("/stats")
@@ -848,22 +1178,38 @@ async def get_stats():
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize on startup"""
-    print("\n" + "="*60)
-    print("🚀 AgriAI - Zero Capital Edition Starting...")
-    print("="*60)
-    print(f"📱 WhatsApp Phone ID: {WHATSAPP_PHONE_ID or 'Not configured'}")
-    print(f"💾 Database: {SUPABASE_URL or 'Not configured'}")
-    print(f"🤖 AI Engine: {'Groq (Free)' if GROQ_API_KEY else 'Rule-based only'}")
-    print("="*60 + "\n")
+    """Initialize on startup with comprehensive logging"""
+    logger.info("=" * 60)
+    logger.info("🚀 AgriAI - Zero Capital Edition Starting...")
+    logger.info("=" * 60)
+    logger.info(f"📱 WhatsApp Phone ID: {WHATSAPP_PHONE_ID or 'Not configured'}")
+    logger.info(f"💾 Database: {SUPABASE_URL or 'Not configured'}")
+    logger.info(f"🤖 AI Engine: {'Groq (Free)' if GROQ_API_KEY else 'Rule-based only'}")
+    logger.info(f"🔒 CORS Origins: {', '.join(ALLOWED_ORIGINS)}")
+    logger.info("=" * 60)
+    
+    # Configuration warnings
+    warnings = []
     
     if not SUPABASE_URL or not SUPABASE_KEY:
-        print("⚠️  WARNING: Supabase not configured. Using in-memory storage.")
+        warnings.append("Supabase not configured. Using in-memory storage.")
+        logger.warning("⚠️  Supabase not configured. Using in-memory storage.")
     
     if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_ID:
-        print("⚠️  WARNING: WhatsApp not configured. Messages will be logged only.")
+        warnings.append("WhatsApp not configured. Messages will be logged only.")
+        logger.warning("⚠️  WhatsApp not configured. Messages will be logged only.")
     
-    print("✅ Server ready!\n")
+    if not GROQ_API_KEY:
+        warnings.append("Groq AI not configured. Using rule-based diagnosis only.")
+        logger.warning("⚠️  Groq AI not configured. Using rule-based diagnosis only.")
+    
+    if warnings:
+        logger.warning(f"Total warnings: {len(warnings)}")
+    else:
+        logger.info("✅ All services configured!")
+    
+    logger.info("✅ Server ready and listening for requests!")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":
