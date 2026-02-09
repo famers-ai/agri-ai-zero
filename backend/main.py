@@ -21,6 +21,10 @@ from datetime import datetime
 import asyncio
 from supabase import create_client, Client
 import hashlib
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ============================================================================
 # CONFIGURATION
@@ -51,7 +55,12 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # Initialize Supabase client
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    # Only initialize if URL looks valid (starts with https://)
+    if SUPABASE_URL.startswith("https://") and not SUPABASE_KEY.startswith("your-"):
+        try:
+            supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        except Exception as e:
+            print(f"⚠️  Failed to initialize Supabase: {e}")
 
 # ============================================================================
 # DATABASE FUNCTIONS
