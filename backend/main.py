@@ -22,9 +22,28 @@ import asyncio
 from supabase import create_client, Client
 import hashlib
 from dotenv import load_dotenv
+import secrets
 
 # Load environment variables from .env file
 load_dotenv()
+
+# ============================================================================
+# SECURITY UTILITIES
+# ============================================================================
+
+def hash_phone_number(phone: str) -> str:
+    """
+    Hash phone number for privacy protection
+    Uses SHA-256 to create a one-way hash
+    """
+    # Add a salt from environment for extra security
+    salt = os.getenv("PHONE_HASH_SALT", "agri-ai-default-salt-2026")
+    salted_phone = f"{salt}:{phone}"
+    return hashlib.sha256(salted_phone.encode()).hexdigest()
+
+def generate_secure_token(length: int = 32) -> str:
+    """Generate cryptographically secure random token"""
+    return secrets.token_urlsafe(length)
 
 # ============================================================================
 # CONFIGURATION
@@ -36,12 +55,19 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# CORS Configuration - Security Hardened
+# Only allow requests from trusted origins
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "https://web-production-17eb9.up.railway.app,http://localhost:8000,http://localhost:3000"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,  # Only specific domains
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],  # Only necessary methods
+    allow_headers=["Content-Type", "Authorization"],  # Only necessary headers
 )
 
 # Environment variables
