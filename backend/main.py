@@ -28,8 +28,11 @@ import traceback
 import sys
 from contextlib import asynccontextmanager
 
-# Load environment variables from .env file
-load_dotenv()
+from pathlib import Path
+
+# Load environment variables
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 # ============================================================================
 # LOGGING CONFIGURATION
@@ -1136,7 +1139,7 @@ async def process_whatsapp_webhook(data: Dict):
                 value = change.get("value", {})
                 
                 if "messages" in value:
-                    for message in value["messages"]:
+                    for message in value.get("messages", []):
                         message_count += 1
                         
                         # Process each message with error handling

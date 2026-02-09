@@ -17,7 +17,7 @@ source venv/bin/activate
 # 3. 의존성 설치
 echo "📚 3/4: 라이브러리 설치 중..."
 pip install --upgrade pip
-pip install -r backend/requirements.txt
+pip install -r requirements.txt
 
 # 4. .env 파일 생성
 echo "⚙️  4/4: 환경 변수 파일 생성 중..."
